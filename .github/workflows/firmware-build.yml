@@ -6,7 +6,7 @@ on:
       build_list:
         description: "Build list file(s), comma or newline separated"
         required: true
-        default: "build_list.yaml,build_list_timurey.yaml,build_list_m1nl.yaml,build_list_engineerXIII.yaml"
+        default: "build_list.yaml,build_list_timurey.yaml,build_list_m1nl.yaml,build_list_engineerXIII.yaml,build_list_svk.yaml"
       mode:
         description: "Filter variants by build mode"
         type: choice
