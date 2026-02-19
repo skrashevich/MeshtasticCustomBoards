@@ -10,6 +10,7 @@ import json
 import re
 from pathlib import Path
 from typing import Any
+from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 
@@ -21,7 +22,7 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def api_get_json(url: str, token: str) -> Any:
+def api_request(url: str, token: str) -> str:
     req = Request(
         url=url,
         headers={
@@ -32,7 +33,11 @@ def api_get_json(url: str, token: str) -> Any:
         },
     )
     with urlopen(req, timeout=30) as resp:
-        return json.loads(resp.read().decode("utf-8"))
+        return resp.read().decode("utf-8")
+
+
+def api_get_json(url: str, token: str) -> Any:
+    return json.loads(api_request(url, token))
 
 
 def fetch_releases(repo: str, token: str) -> list[dict[str, Any]]:
@@ -84,9 +89,7 @@ def parse_timestamp(raw: str) -> tuple[str, str]:
         parsed = dt.datetime.fromisoformat(raw.replace("Z", "+00:00"))
     except ValueError:
         return raw, raw
-    pretty = parsed.strftime("%Y-%m-%d %H:%M UTC")
-    sortable = parsed.isoformat()
-    return pretty, sortable
+    return parsed.strftime("%Y-%m-%d %H:%M UTC"), parsed.isoformat()
 
 
 def derive_device_slug(asset_name: str, version_label: str) -> str:
@@ -111,7 +114,67 @@ def derive_variant_label(asset_name: str, device_slug: str, version_label: str) 
     return "archive"
 
 
-def classify_release(raw_release: dict[str, Any]) -> dict[str, Any]:
+def source_sort_key(source_name: str) -> tuple[int, str]:
+    if source_name == "unknown-build-list":
+        return (1, source_name)
+    return (0, source_name)
+
+
+def normalize_source_name(raw: str) -> str:
+    value = raw.strip()
+    if not value or value == "unknown":
+        return "unknown-build-list"
+    if value == "unknown-build-list":
+        return value
+    if value.endswith(".yaml"):
+        return value
+    if value.startswith("build_list"):
+        return f"{value}.yaml"
+    return value
+
+
+def pick_source_name(meta: dict[str, str]) -> str:
+    for key in ("build_list_file", "build_list_slug", "source_slug"):
+        raw = str(meta.get(key, "")).strip()
+        if raw and raw not in {"unknown", "unknown-build-list"}:
+            return normalize_source_name(raw)
+    return "unknown-build-list"
+
+
+def load_release_matrix(
+    matrix_asset: dict[str, Any] | None,
+    token: str,
+) -> dict[str, dict[str, str]]:
+    if not matrix_asset:
+        return {}
+    url = matrix_asset.get("browser_download_url", "")
+    if not url:
+        return {}
+
+    try:
+        payload = api_get_json(url, token)
+    except (HTTPError, URLError, TimeoutError, ValueError):
+        return {}
+
+    if not isinstance(payload, list):
+        return {}
+
+    by_archive: dict[str, dict[str, str]] = {}
+    for item in payload:
+        if not isinstance(item, dict):
+            continue
+        archive_name = str(item.get("archive_name", "")).strip()
+        if not archive_name:
+            continue
+        by_archive[archive_name] = {
+            "build_list_file": str(item.get("build_list_file", "")).strip(),
+            "build_list_slug": str(item.get("build_list_slug", "")).strip(),
+            "source_slug": str(item.get("source_slug", "")).strip(),
+        }
+    return by_archive
+
+
+def classify_release(raw_release: dict[str, Any], token: str) -> dict[str, Any]:
     assets = raw_release.get("assets", [])
     version_label = parse_version_label(assets)
 
@@ -120,6 +183,7 @@ def classify_release(raw_release: dict[str, Any]) -> dict[str, Any]:
     checksums = None
     files_manifest = None
     build_info = None
+    release_matrix_asset = None
     per_device_assets: list[dict[str, Any]] = []
     other_assets: list[dict[str, Any]] = []
 
@@ -135,60 +199,74 @@ def classify_release(raw_release: dict[str, Any]) -> dict[str, Any]:
             files_manifest = asset
         elif name == "BUILD_INFO.json":
             build_info = asset
+        elif name == "RELEASE_MATRIX.json":
+            release_matrix_asset = asset
         elif name.startswith("firmware-") and name.endswith(".zip"):
             per_device_assets.append(asset)
         else:
             other_assets.append(asset)
 
-    device_groups: dict[str, list[dict[str, str]]] = {}
-    for asset in per_device_assets:
-        name = asset.get("name", "")
-        device_slug = derive_device_slug(name, version_label)
-        variant_label = derive_variant_label(name, device_slug, version_label)
+    matrix_by_archive = load_release_matrix(release_matrix_asset, token)
 
-        device_groups.setdefault(device_slug, []).append(
+    device_groups: dict[str, dict[str, list[dict[str, str]]]] = {}
+    for asset in per_device_assets:
+        asset_name = asset.get("name", "")
+        device_slug = derive_device_slug(asset_name, version_label)
+        variant_label = derive_variant_label(asset_name, device_slug, version_label)
+        source_name = pick_source_name(matrix_by_archive.get(asset_name, {}))
+
+        device_group = device_groups.setdefault(device_slug, {})
+        source_group = device_group.setdefault(source_name, [])
+        source_group.append(
             {
                 "variant_label": variant_label,
-                "asset_name": name,
+                "asset_name": asset_name,
                 "download_url": asset.get("browser_download_url", ""),
                 "size_text": fmt_size(int(asset.get("size", 0))),
             }
         )
 
-    for slug in device_groups:
-        device_groups[slug].sort(key=lambda item: item["asset_name"])
+    for device_slug in list(device_groups.keys()):
+        sorted_sources: dict[str, list[dict[str, str]]] = {}
+        for source_name in sorted(device_groups[device_slug], key=source_sort_key):
+            rows = device_groups[device_slug][source_name]
+            rows.sort(key=lambda item: item["asset_name"])
+            sorted_sources[source_name] = rows
+        device_groups[device_slug] = sorted_sources
 
-    published_at = raw_release.get("published_at") or raw_release.get("created_at") or ""
-    published_at_text, published_at_sortable = parse_timestamp(published_at)
+    published_raw = raw_release.get("published_at") or raw_release.get("created_at") or ""
+    published_text, published_sort = parse_timestamp(published_raw)
     release_name = raw_release.get("name") or raw_release.get("tag_name") or "Untitled release"
     release_tag = raw_release.get("tag_name", "")
 
-    search_tokens: list[str] = [
-        release_name.lower(),
-        release_tag.lower(),
-        version_label.lower(),
-    ]
-    for slug, variants in device_groups.items():
-        search_tokens.append(slug.lower())
-        for item in variants:
-            search_tokens.append(item["asset_name"].lower())
-            search_tokens.append(item["variant_label"].lower())
+    unique_sources: set[str] = set()
+    search_tokens = [release_name.lower(), release_tag.lower(), version_label.lower()]
+    for device_slug, source_groups in device_groups.items():
+        search_tokens.append(device_slug.lower())
+        for source_name, rows in source_groups.items():
+            unique_sources.add(source_name)
+            search_tokens.append(source_name.lower())
+            for row in rows:
+                search_tokens.append(row["asset_name"].lower())
+                search_tokens.append(row["variant_label"].lower())
 
     return {
         "name": release_name,
         "tag_name": release_tag,
         "html_url": raw_release.get("html_url", ""),
         "is_prerelease": bool(raw_release.get("prerelease")),
-        "published_at": published_at_text or published_at,
-        "published_at_sort": published_at_sortable or published_at,
+        "published_at": published_text or published_raw,
+        "published_at_sort": published_sort or published_raw,
         "assets_total": len(assets),
         "devices_total": len(device_groups),
+        "sources_total": len(unique_sources),
         "version_label": version_label,
         "firmware_all": firmware_all,
         "firmware_bundle": firmware_bundle,
         "checksums": checksums,
         "files_manifest": files_manifest,
         "build_info": build_info,
+        "release_matrix_asset": release_matrix_asset,
         "device_groups": dict(sorted(device_groups.items(), key=lambda item: item[0])),
         "other_assets": sorted(other_assets, key=lambda item: item.get("name", "")),
         "search_blob": " ".join(token for token in search_tokens if token),
@@ -197,15 +275,19 @@ def classify_release(raw_release: dict[str, Any]) -> dict[str, Any]:
 
 def build_stats(releases: list[dict[str, Any]]) -> dict[str, int]:
     device_names: set[str] = set()
+    source_names: set[str] = set()
     variants_total = 0
     for release in releases:
         groups = release.get("device_groups", {})
         device_names.update(groups.keys())
-        for variants in groups.values():
-            variants_total += len(variants)
+        for source_groups in groups.values():
+            source_names.update(source_groups.keys())
+            for rows in source_groups.values():
+                variants_total += len(rows)
     return {
         "releases_total": len(releases),
         "devices_total": len(device_names),
+        "sources_total": len(source_names),
         "variants_total": variants_total,
     }
 
@@ -219,9 +301,14 @@ def render_asset_chip(label: str, asset: dict[str, Any] | None) -> str:
     return f'<a class="chip" href="{url}" title="{title}">{html.escape(label)} · {size}</a>'
 
 
+def render_source_name(source_name: str) -> str:
+    if source_name == "unknown-build-list":
+        return "unknown"
+    return source_name
+
+
 def render_release_card(release: dict[str, Any]) -> str:
     prerelease_badge = '<span class="badge">pre-release</span>' if release["is_prerelease"] else ""
-
     quick_links = "".join(
         [
             render_asset_chip("All firmware BIN", release["firmware_all"]),
@@ -229,24 +316,43 @@ def render_release_card(release: dict[str, Any]) -> str:
             render_asset_chip("SHA256SUMS", release["checksums"]),
             render_asset_chip("FILES", release["files_manifest"]),
             render_asset_chip("BUILD_INFO", release["build_info"]),
+            render_asset_chip("RELEASE_MATRIX", release["release_matrix_asset"]),
         ]
     )
 
     device_cards: list[str] = []
-    for device_slug, variants in release["device_groups"].items():
-        items = "".join(
-            f'<li><a href="{html.escape(item["download_url"])}">{html.escape(item["asset_name"])}</a> '
-            f'<span class="muted">{html.escape(item["variant_label"])} · {html.escape(item["size_text"])}</span></li>'
-            for item in variants
-        )
-        device_search = " ".join(
-            [device_slug.lower()] + [item["asset_name"].lower() for item in variants]
-        )
+    for device_slug, source_groups in release["device_groups"].items():
+        table_rows: list[str] = []
+        search_tokens = [device_slug.lower()]
+        for source_name, rows in source_groups.items():
+            source_display = render_source_name(source_name)
+            search_tokens.append(source_name.lower())
+            for row in rows:
+                search_tokens.append(row["asset_name"].lower())
+                table_rows.append(
+                    "<tr>"
+                    f'<td><code>{html.escape(source_display)}</code></td>'
+                    f'<td><a href="{html.escape(row["download_url"])}">{html.escape(row["asset_name"])}</a></td>'
+                    f'<td class="muted">{html.escape(row["variant_label"])}</td>'
+                    f'<td class="muted">{html.escape(row["size_text"])}</td>'
+                    "</tr>"
+                )
+
+        if table_rows:
+            table_html = (
+                '<table class="fw-table">'
+                "<thead><tr><th>Source (build_list)</th><th>Archive</th><th>Variant</th><th>Size</th></tr></thead>"
+                f"<tbody>{''.join(table_rows)}</tbody>"
+                "</table>"
+            )
+        else:
+            table_html = '<p class="muted">No firmware archives for this device.</p>'
+
         device_cards.append(
             f"""
-            <article class="device-card" data-search="{html.escape(device_search)}">
+            <article class="device-card" data-search="{html.escape(' '.join(search_tokens))}">
               <h3>{html.escape(device_slug)}</h3>
-              <ul>{items}</ul>
+              {table_html}
             </article>
             """
         )
@@ -263,6 +369,7 @@ def render_release_card(release: dict[str, Any]) -> str:
             Tag <code>{html.escape(release["tag_name"])}</code> ·
             Published {html.escape(release["published_at"])} ·
             Devices {release["devices_total"]} ·
+            Sources {release["sources_total"]} ·
             Assets {release["assets_total"]}
           </p>
         </div>
@@ -315,7 +422,7 @@ def render_html(repo: str, releases: list[dict[str, Any]]) -> str:
       min-height: 100vh;
     }}
     .layout {{
-      max-width: 1240px;
+      max-width: 1260px;
       margin: 0 auto;
       padding: 24px 18px 36px;
     }}
@@ -436,7 +543,7 @@ def render_html(repo: str, releases: list[dict[str, Any]]) -> str:
     }}
     .device-grid {{
       display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+      grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
       gap: 10px;
     }}
     .device-card {{
@@ -444,20 +551,31 @@ def render_html(repo: str, releases: list[dict[str, Any]]) -> str:
       border: 1px solid var(--line);
       border-radius: 12px;
       padding: 10px;
+      overflow-x: auto;
     }}
     .device-card h3 {{
       margin: 0 0 8px;
       font-size: 15px;
       color: #132943;
     }}
-    .device-card ul {{
-      margin: 0;
-      padding-left: 18px;
+    .fw-table {{
+      width: 100%;
+      border-collapse: collapse;
+      min-width: 480px;
     }}
-    .device-card li {{
-      margin-bottom: 5px;
+    .fw-table th, .fw-table td {{
+      border-top: 1px solid #e5ebf2;
+      padding: 6px 7px;
+      text-align: left;
+      vertical-align: top;
+      font-size: 12px;
     }}
-    .device-card a {{
+    .fw-table th {{
+      color: #3a4a61;
+      font-weight: 600;
+      background: #f7fafc;
+    }}
+    .fw-table a {{
       color: #0f5f84;
       text-decoration: none;
       font-family: "IBM Plex Mono", monospace;
@@ -495,6 +613,8 @@ def render_html(repo: str, releases: list[dict[str, Any]]) -> str:
       .hero {{ border-radius: 14px; }}
       .release-header {{ flex-direction: column; }}
       .open-release {{ width: 100%; text-align: center; }}
+      .device-grid {{ grid-template-columns: 1fr; }}
+      .fw-table {{ min-width: 420px; }}
     }}
   </style>
 </head>
@@ -506,14 +626,15 @@ def render_html(repo: str, releases: list[dict[str, Any]]) -> str:
       <div class="stats">
         <span class="stat">Releases: {stats["releases_total"]}</span>
         <span class="stat">Devices: {stats["devices_total"]}</span>
+        <span class="stat">Sources: {stats["sources_total"]}</span>
         <span class="stat">Device archives: {stats["variants_total"]}</span>
       </div>
     </header>
 
     <section class="panel">
       <div class="search-row">
-        <label for="device-search">Filter by device, tag, or asset name:</label>
-        <input id="device-search" class="search-input" type="search" placeholder="e.g. heltec-v2_1 or snapshot-20260218" />
+        <label for="device-search">Filter by device, source, tag, or asset name:</label>
+        <input id="device-search" class="search-input" type="search" placeholder="e.g. heltec-v2_1 or build_list_svk.yaml" />
       </div>
       <p id="search-status" class="muted">Showing all releases.</p>
     </section>
@@ -577,7 +698,7 @@ def main() -> int:
     output_dir.mkdir(parents=True, exist_ok=True)
 
     raw_releases = fetch_releases(args.repo, args.token)
-    releases = [classify_release(item) for item in raw_releases]
+    releases = [classify_release(item, args.token) for item in raw_releases]
 
     (output_dir / "index.html").write_text(render_html(args.repo, releases), encoding="utf-8")
     (output_dir / "releases.json").write_text(

@@ -219,25 +219,34 @@ jobs:
           }
 
           flat_fw_dir="$(mktemp -d)"
+          release_matrix_tmp="$(mktemp)"
           device_archives_count=0
 
           while IFS= read -r ver_info_path; do
             device_version_dir="$(dirname "${ver_info_path}")"
             device_dir="$(dirname "${device_version_dir}")"
             device_info_path="${device_dir}/device.info"
+            build_name="$(basename "${device_dir}")"
+            artifact_dir="$(basename "$(dirname "${device_dir}")")"
             device_slug_source=""
+            pio_target_value=""
 
             if [[ -f "${device_info_path}" ]]; then
               device_slug_source="$(jq -r '.pio_target // empty' "${device_info_path}" 2>/dev/null || true)"
+              pio_target_value="${device_slug_source}"
             fi
             if [[ -z "${device_slug_source}" ]]; then
               device_slug_source="$(jq -r '.pio_target // empty' "${ver_info_path}" 2>/dev/null || true)"
+              pio_target_value="${device_slug_source}"
             fi
             if [[ -z "${device_slug_source}" && -f "${device_info_path}" ]]; then
               device_slug_source="$(jq -r '.name // empty' "${device_info_path}" 2>/dev/null || true)"
             fi
             if [[ -z "${device_slug_source}" ]]; then
               device_slug_source="$(basename "${device_dir}")"
+            fi
+            if [[ -z "${pio_target_value}" ]]; then
+              pio_target_value="${device_slug_source}"
             fi
 
             device_slug="$(sanitize_slug "${device_slug_source}")"
@@ -274,6 +283,57 @@ jobs:
             rm -rf "${tmp_device_dir}"
             device_archives_count=$((device_archives_count + 1))
 
+            artifact_core="${artifact_dir#firmware-}"
+            if [[ -n "${version_label}" && "${artifact_core}" == *"-${version_label}" ]]; then
+              artifact_core="${artifact_core%-${version_label}}"
+            fi
+            source_and_build="${artifact_core}"
+            if [[ "${source_and_build}" == *"-${build_name}" ]]; then
+              source_and_build="${source_and_build%-${build_name}}"
+            fi
+
+            build_list_slug=""
+            source_slug=""
+            if [[ "${source_and_build}" =~ (build_list[[:alnum:]_.-]*) ]]; then
+              build_list_slug="${BASH_REMATCH[1]}"
+              source_slug="${source_and_build%-${build_list_slug}}"
+              source_slug="${source_slug%-}"
+            fi
+
+            if [[ -z "${source_slug}" ]]; then
+              source_slug="${source_and_build}"
+            fi
+            if [[ -z "${source_slug}" ]]; then
+              source_slug="unknown-source"
+            fi
+            if [[ -z "${build_list_slug}" ]]; then
+              build_list_slug="unknown-build-list"
+            fi
+
+            build_list_file="unknown"
+            if [[ "${build_list_slug}" != "unknown-build-list" ]]; then
+              build_list_file="${build_list_slug}.yaml"
+            fi
+
+            device_archive_name="$(basename "${device_archive_path}")"
+            jq -nc \
+              --arg archive_name "${device_archive_name}" \
+              --arg device_slug "${device_slug}" \
+              --arg pio_target "${pio_target_value}" \
+              --arg build_name "${build_name}" \
+              --arg source_slug "${source_slug}" \
+              --arg build_list_slug "${build_list_slug}" \
+              --arg build_list_file "${build_list_file}" \
+              '{
+                archive_name: $archive_name,
+                device_slug: $device_slug,
+                pio_target: $pio_target,
+                build_name: $build_name,
+                source_slug: $source_slug,
+                build_list_slug: $build_list_slug,
+                build_list_file: $build_list_file
+              }' >> "${release_matrix_tmp}"
+
             shopt -s nullglob
             fw_bins=("${device_version_dir}"/firmware-*.bin)
             shopt -u nullglob
@@ -303,6 +363,12 @@ jobs:
             zip -q -r "${OLDPWD}/release-assets/${all_firmware_archive_name}" firmware-*.bin
           )
           rm -rf "${flat_fw_dir}"
+          if [[ -s "${release_matrix_tmp}" ]]; then
+            jq -s '.' "${release_matrix_tmp}" > release-assets/RELEASE_MATRIX.json
+          else
+            echo "[]" > release-assets/RELEASE_MATRIX.json
+          fi
+          rm -f "${release_matrix_tmp}"
 
           find release-input -type f | sort > release-assets/FILES.txt
           sha256sum \
@@ -319,7 +385,8 @@ jobs:
             "version_label": "${{ needs.resolve.outputs.version_label }}",
             "bundle_artifact": "${{ needs.resolve.outputs.bundle_artifact }}",
             "firmware_all_archive": "${all_firmware_archive_name}",
-            "device_archives_count": ${device_archives_count}
+            "device_archives_count": ${device_archives_count},
+            "release_matrix": "RELEASE_MATRIX.json"
           }
           EOF
 
@@ -338,3 +405,4 @@ jobs:
             release-assets/SHA256SUMS.txt
             release-assets/FILES.txt
             release-assets/BUILD_INFO.json
+            release-assets/RELEASE_MATRIX.json
