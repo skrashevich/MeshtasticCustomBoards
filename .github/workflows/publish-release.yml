@@ -212,7 +212,30 @@ jobs:
           all_firmware_archive_name="firmware-all-${{ needs.resolve.outputs.version_label }}.zip"
           version_label="${{ needs.resolve.outputs.version_label }}"
 
-          tar -czf "release-assets/${bundle_archive_name}" -C release-input .
+          normalized_bundle_dir="$(mktemp -d)"
+
+          while IFS= read -r ver_info_path; do
+            device_version_dir="$(dirname "${ver_info_path}")"
+            device_dir="$(dirname "${device_version_dir}")"
+            device_info_path="${device_dir}/device.info"
+            build_name="$(basename "${device_dir}")"
+            version_dir_name="$(basename "${device_version_dir}")"
+
+            target_device_dir="${normalized_bundle_dir}/${build_name}"
+            target_version_dir="${target_device_dir}/${version_dir_name}"
+            mkdir -p "${target_version_dir}"
+            if [[ -f "${device_info_path}" ]]; then
+              cp -f "${device_info_path}" "${target_device_dir}/device.info"
+            fi
+            cp -a "${device_version_dir}/." "${target_version_dir}/"
+          done < <(find release-input -type f -name 'ver.info' | sort)
+
+          if ! find "${normalized_bundle_dir}" -mindepth 1 -maxdepth 1 -type d | grep -q .; then
+            echo "No device version directories found in bundle input" >&2
+            exit 1
+          fi
+
+          tar -czf "release-assets/${bundle_archive_name}" -C "${normalized_bundle_dir}" .
 
           sanitize_slug() {
             echo "$1" | sed -E 's/[^a-zA-Z0-9._-]+/-/g; s/^-+//; s/-+$//'
@@ -274,6 +297,60 @@ jobs:
             rm -rf "${tmp_device_dir}"
             device_archives_count=$((device_archives_count + 1))
 
+            artifact_core="${artifact_dir#firmware-}"
+            if [[ -n "${version_label}" && "${artifact_core}" == *"-${version_label}" ]]; then
+              artifact_core="${artifact_core%-${version_label}}"
+            fi
+            source_and_build="${artifact_core}"
+            if [[ "${source_and_build}" == *"-${build_name}" ]]; then
+              source_and_build="${source_and_build%-${build_name}}"
+            fi
+            if [[ "${source_and_build}" == "release-input" ]]; then
+              source_and_build=""
+            fi
+
+            build_list_slug=""
+            source_slug=""
+            if [[ "${source_and_build}" =~ (build_list[[:alnum:]_.-]*) ]]; then
+              build_list_slug="${BASH_REMATCH[1]}"
+              source_slug="${source_and_build%-${build_list_slug}}"
+              source_slug="${source_slug%-}"
+            fi
+
+            if [[ -z "${source_slug}" ]]; then
+              source_slug="${source_and_build}"
+            fi
+            if [[ -z "${source_slug}" ]]; then
+              source_slug="unknown-source"
+            fi
+            if [[ -z "${build_list_slug}" ]]; then
+              build_list_slug="unknown-build-list"
+            fi
+
+            build_list_file="unknown"
+            if [[ "${build_list_slug}" != "unknown-build-list" ]]; then
+              build_list_file="${build_list_slug}.yaml"
+            fi
+
+            device_archive_name="$(basename "${device_archive_path}")"
+            jq -nc \
+              --arg archive_name "${device_archive_name}" \
+              --arg device_slug "${device_slug}" \
+              --arg pio_target "${pio_target_value}" \
+              --arg build_name "${build_name}" \
+              --arg source_slug "${source_slug}" \
+              --arg build_list_slug "${build_list_slug}" \
+              --arg build_list_file "${build_list_file}" \
+              '{
+                archive_name: $archive_name,
+                device_slug: $device_slug,
+                pio_target: $pio_target,
+                build_name: $build_name,
+                source_slug: $source_slug,
+                build_list_slug: $build_list_slug,
+                build_list_file: $build_list_file
+              }' >> "${release_matrix_tmp}"
+
             shopt -s nullglob
             fw_bins=("${device_version_dir}"/firmware-*.bin)
             shopt -u nullglob
@@ -304,7 +381,12 @@ jobs:
           )
           rm -rf "${flat_fw_dir}"
 
-          find release-input -type f | sort > release-assets/FILES.txt
+          (
+            cd "${normalized_bundle_dir}"
+            find . -type f | sort
+          ) > release-assets/FILES.txt
+          rm -rf "${normalized_bundle_dir}"
+
           sha256sum \
             "release-assets/${bundle_archive_name}" \
             release-assets/*.zip \
