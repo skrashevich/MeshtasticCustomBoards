@@ -312,7 +312,35 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           pattern: firmware-*
-          path: firmware-artifacts
+          path: firmware-artifacts-raw
+
+      - name: Normalize bundle structure
+        run: |
+          set -euo pipefail
+
+          mkdir -p firmware-artifacts
+
+          while IFS= read -r ver_info_path; do
+            device_version_dir="$(dirname "${ver_info_path}")"
+            device_dir="$(dirname "${device_version_dir}")"
+            device_info_path="${device_dir}/device.info"
+            build_name="$(basename "${device_dir}")"
+            version_dir_name="$(basename "${device_version_dir}")"
+
+            target_device_dir="firmware-artifacts/${build_name}"
+            target_version_dir="${target_device_dir}/${version_dir_name}"
+            mkdir -p "${target_version_dir}"
+
+            if [[ -f "${device_info_path}" ]]; then
+              cp -f "${device_info_path}" "${target_device_dir}/device.info"
+            fi
+            cp -a "${device_version_dir}/." "${target_version_dir}/"
+          done < <(find firmware-artifacts-raw -type f -name 'ver.info' | sort)
+
+          if ! find firmware-artifacts -mindepth 1 -maxdepth 1 -type d | grep -q .; then
+            echo "No device version directories found in downloaded artifacts" >&2
+            exit 1
+          fi
 
       - name: Upload merged bundle
         uses: actions/upload-artifact@v4
