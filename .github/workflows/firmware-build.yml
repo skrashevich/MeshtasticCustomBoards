@@ -334,7 +334,6 @@ jobs:
         with:
           pattern: build-report-*
           path: build-reports
-          merge-multiple: true
 
       - name: Assess majority success
         run: |
@@ -342,13 +341,15 @@ jobs:
 
           expected_total=${{ needs.prepare.outputs.devices_count }}
 
-          if ! compgen -G "build-reports/*.json" > /dev/null; then
+          mapfile -t report_files < <(find build-reports -type f -name '*.json' | sort)
+
+          if [[ "${#report_files[@]}" -eq 0 ]]; then
             echo "No build reports found" >&2
             exit 1
           fi
 
-          success_total="$(jq -s '[.[] | select(.status == "success")] | length' build-reports/*.json)"
-          reported_total="$(jq -s 'length' build-reports/*.json)"
+          success_total="$(jq -s '[.[] | select(.status == "success")] | length' "${report_files[@]}")"
+          reported_total="${#report_files[@]}"
           failed_total=$((expected_total - success_total))
           if [[ "${failed_total}" -lt 0 ]]; then
             failed_total=0
