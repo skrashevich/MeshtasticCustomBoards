@@ -11,7 +11,7 @@ on:
         description: "Filter variants by build mode"
         type: choice
         required: true
-        default: "daily"
+        default: "release"
         options:
           - daily
           - release
@@ -44,8 +44,8 @@ on:
         description: "Optional text for ver.info"
         required: false
         default: ""
-  schedule:
-    - cron: "20 2 * * *"
+#  schedule:
+#    - cron: "20 2 * * *"
 
 permissions:
   contents: read
